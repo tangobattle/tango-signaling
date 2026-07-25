@@ -187,7 +187,13 @@ fn fingerprint_display(fp: &[u8]) -> String {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub type Connecting = futures_util::future::BoxFuture<'static, Result<Connected, Error>>;
+
+/// The same, minus `Send`: in a browser this future holds JS handles
+/// pinned to their thread, and there is no other thread to send it to.
+#[cfg(target_arch = "wasm32")]
+pub type Connecting = futures_util::future::LocalBoxFuture<'static, Result<Connected, Error>>;
 
 /// Parse a DTLS certificate fingerprint out of an SDP blob, returning the raw
 /// SHA-256 digest bytes. SDP carries it as an `a=fingerprint:sha-256 <hex>`
