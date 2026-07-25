@@ -30,10 +30,10 @@ const MAX_RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_sec
 pub type ChannelSpec = (&'static str, datachannel_wrapper::DataChannelInit);
 
 /// Build a fresh peer connection, create every requested channel on it, then
-/// generate the offer. Returns immediately with a (candidate-less or partial)
-/// local description — ICE candidates are trickled separately as they gather, so
-/// the offer ships before gathering finishes. Channels come back in the same
-/// order as `channels`.
+/// generate the offer. Returns as soon as the offer exists — ICE candidates are
+/// trickled separately as they gather, so it ships before gathering finishes,
+/// and any that arrived in the meantime come back for the caller to buffer.
+/// Channels come back in the same order as `channels`.
 ///
 /// Auto-negotiation is disabled and the offer is driven explicitly *after* all
 /// channels exist: relying on auto-negotiation here raced the channel creation,
@@ -50,10 +50,12 @@ async fn create_data_channels(
         Vec<datachannel_wrapper::DataChannel>,
         tokio::sync::mpsc::Receiver<datachannel_wrapper::PeerConnectionEvent>,
         datachannel_wrapper::PeerConnection,
+        datachannel_wrapper::SessionDescription,
+        Vec<String>,
     ),
-    std::io::Error,
+    Error,
 > {
-    let (mut peer_conn, event_rx) = datachannel_wrapper::PeerConnection::new(rtc_config)?;
+    let (mut peer_conn, mut event_rx) = datachannel_wrapper::PeerConnection::new(rtc_config)?;
 
     let dcs = channels
         .iter()
@@ -63,11 +65,42 @@ async fn create_data_channels(
     // All channels registered — now drive the single offer that puts them all
     // in the initial association and starts gathering.
     peer_conn.set_local_description(datachannel_wrapper::SdpType::Offer, None)?;
+    let mut early_candidates = Vec::new();
+    let offer = await_local_description(&mut event_rx, &mut early_candidates).await?;
 
-    // Trickle ICE: don't wait for gathering. `local_description()` already holds
-    // the offer; candidates flow out of `event_rx` as they're gathered and the
-    // caller forwards each as an `IceCandidate` packet.
-    Ok((dcs, event_rx, peer_conn))
+    Ok((dcs, event_rx, peer_conn, offer, early_candidates))
+}
+
+/// Wait for the local description we just asked for.
+///
+/// libdatachannel has one ready by the time `set_local_description` returns,
+/// but a browser cannot: `createOffer` / `createAnswer` are Promises, so the
+/// description exists only once the microtask queue gets to it. Both targets
+/// report it the same way — as a `SessionDescription` event — so awaiting that
+/// is the one shape that's correct on either. Candidates gathered while we wait
+/// are buffered, exactly as the exchange loop buffers them.
+async fn await_local_description(
+    event_rx: &mut tokio::sync::mpsc::Receiver<datachannel_wrapper::PeerConnectionEvent>,
+    pending_local_candidates: &mut Vec<String>,
+) -> Result<datachannel_wrapper::SessionDescription, Error> {
+    loop {
+        match event_rx.recv().await {
+            Some(datachannel_wrapper::PeerConnectionEvent::SessionDescription(sdp)) => return Ok(sdp),
+            Some(datachannel_wrapper::PeerConnectionEvent::IceCandidate(c)) => {
+                pending_local_candidates.push(c.candidate)
+            }
+            Some(_) => continue,
+            // The peer connection died before it could produce one — a
+            // failed createOffer/createAnswer drives it straight to Failed.
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "the peer connection failed before it produced a local description",
+                )
+                .into())
+            }
+        }
+    }
 }
 
 /// Encode and send one signaling `Packet` over the websocket.
@@ -241,6 +274,7 @@ async fn establish(
         Vec<datachannel_wrapper::DataChannel>,
         tokio::sync::mpsc::Receiver<datachannel_wrapper::PeerConnectionEvent>,
         datachannel_wrapper::PeerConnection,
+        Vec<String>,
     ),
     Error,
 > {
@@ -313,7 +347,7 @@ async fn establish(
         rtc_config.ice_transport_policy = datachannel_wrapper::TransportPolicy::Relay;
     }
     rtc_config.disable_auto_negotiation = true;
-    let (dcs, event_rx, peer_conn) = create_data_channels(rtc_config, channels).await?;
+    let (dcs, event_rx, peer_conn, offer, early_candidates) = create_data_channels(rtc_config, channels).await?;
 
     ws::send_binary(
         &mut signaling_stream,
@@ -321,7 +355,7 @@ async fn establish(
             which: Some(crate::proto::signaling::packet::Which::Start(
                 crate::proto::signaling::packet::Start {
                     protocol_version,
-                    offer_sdp: peer_conn.local_description().unwrap().sdp.to_string(),
+                    offer_sdp: offer.sdp,
                     connection_id: connection_id.to_vec(),
                 },
             )),
@@ -330,7 +364,7 @@ async fn establish(
     )
     .await?;
 
-    Ok((signaling_stream, dcs, event_rx, peer_conn))
+    Ok((signaling_stream, dcs, event_rx, peer_conn, early_candidates))
 }
 
 /// Outcome of waiting on a single signaling websocket for the peer to begin the
@@ -454,13 +488,13 @@ async fn wait_for_exchange(
                 // read before the answer existed.
                 peer_conn.set_local_description(datachannel_wrapper::SdpType::Answer, None)?;
 
-                let local_description = peer_conn.local_description().unwrap();
+                let local_description = await_local_description(event_rx, pending_local_candidates).await?;
                 ws::send_binary(
                     signaling_stream,
                         crate::proto::signaling::Packet {
                             which: Some(crate::proto::signaling::packet::Which::Answer(
                                 crate::proto::signaling::packet::Answer {
-                                    sdp: local_description.sdp.to_string(),
+                                    sdp: local_description.sdp,
                                     // Server-filled: the relay attaches *our* fingerprint
                                     // (observed at its TLS layer) when it forwards this
                                     // answer to the offerer. Nothing we set here survives.
@@ -520,7 +554,7 @@ pub async fn connect(
     // The initial dial surfaces failures to the caller (so "couldn't reach the
     // matchmaking server" is reported promptly); transparent reconnects only
     // kick in once we've successfully connected at least once.
-    let (mut signaling_stream, mut dcs, mut event_rx, mut peer_conn) = establish(
+    let (mut signaling_stream, mut dcs, mut event_rx, mut peer_conn, early_candidates) = establish(
         addr,
         session_id,
         use_relay,
@@ -536,8 +570,9 @@ pub async fn connect(
 
     Ok(Box::pin(async move {
         // Local ICE candidates gathered before the peer has our SDP — buffered by
-        // `wait_for_exchange`, flushed once the exchange completes.
-        let mut pending_local_candidates: Vec<String> = Vec::new();
+        // `wait_for_exchange`, flushed once the exchange completes. Starts with
+        // whatever gathered while we were waiting on the offer.
+        let mut pending_local_candidates: Vec<String> = early_candidates;
 
         // Wait for the peer to start the SDP exchange. As long as the peer hasn't
         // started, a websocket drop is recoverable: tear everything down and dial
@@ -572,14 +607,14 @@ pub async fn connect(
                         )
                         .await
                         {
-                            Ok((s, d, e, p)) => {
+                            Ok((s, d, e, p, early)) => {
                                 signaling_stream = s;
                                 dcs = d;
                                 event_rx = e;
                                 peer_conn = p;
-                                // Fresh peer connection → buffered candidates are
-                                // stale; they'll gather anew.
-                                pending_local_candidates.clear();
+                                // Fresh peer connection → the old buffer is stale;
+                                // what this attempt has gathered so far replaces it.
+                                pending_local_candidates = early;
                                 log::info!("signaling reconnected; still waiting for the peer");
                                 break;
                             }
