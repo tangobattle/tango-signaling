@@ -1,3 +1,4 @@
+use futures_util::StreamExt;
 use futures_util::TryStreamExt;
 use prost::Message;
 
@@ -49,7 +50,7 @@ async fn create_data_channels(
 ) -> Result<
     (
         Vec<datachannel_wrapper::DataChannel>,
-        tokio::sync::mpsc::Receiver<datachannel_wrapper::PeerConnectionEvent>,
+        datachannel_wrapper::EventReceiver,
         datachannel_wrapper::PeerConnection,
         datachannel_wrapper::SessionDescription,
         Vec<String>,
@@ -81,11 +82,11 @@ async fn create_data_channels(
 /// is the one shape that's correct on either. Candidates gathered while we wait
 /// are buffered, exactly as the exchange loop buffers them.
 async fn await_local_description(
-    event_rx: &mut tokio::sync::mpsc::Receiver<datachannel_wrapper::PeerConnectionEvent>,
+    event_rx: &mut datachannel_wrapper::EventReceiver,
     pending_local_candidates: &mut Vec<String>,
 ) -> Result<datachannel_wrapper::SessionDescription, Error> {
     loop {
-        match event_rx.recv().await {
+        match event_rx.next().await {
             Some(datachannel_wrapper::PeerConnectionEvent::SessionDescription(sdp)) => return Ok(sdp),
             Some(datachannel_wrapper::PeerConnectionEvent::IceCandidate(c)) => {
                 pending_local_candidates.push(c.candidate)
@@ -273,7 +274,7 @@ async fn establish(
     (
         SignalingStream,
         Vec<datachannel_wrapper::DataChannel>,
-        tokio::sync::mpsc::Receiver<datachannel_wrapper::PeerConnectionEvent>,
+        datachannel_wrapper::EventReceiver,
         datachannel_wrapper::PeerConnection,
         Vec<String>,
     ),
@@ -391,7 +392,7 @@ enum WaitOutcome {
 /// anything become `Dropped`, which the caller may transparently reconnect.
 async fn wait_for_exchange(
     signaling_stream: &mut SignalingStream,
-    event_rx: &mut tokio::sync::mpsc::Receiver<datachannel_wrapper::PeerConnectionEvent>,
+    event_rx: &mut datachannel_wrapper::EventReceiver,
     peer_conn: &mut datachannel_wrapper::PeerConnection,
     pending_local_candidates: &mut Vec<String>,
 ) -> Result<WaitOutcome, Error> {
@@ -404,7 +405,7 @@ async fn wait_for_exchange(
             // has our offer/answer); they're flushed right after. No connection
             // state can change before a remote description exists, so anything
             // else is ignored.
-            event = event_rx.recv() => {
+            event = event_rx.next() => {
                 if let Some(datachannel_wrapper::PeerConnectionEvent::IceCandidate(c)) = event {
                     pending_local_candidates.push(c.candidate);
                 }
@@ -676,7 +677,7 @@ pub async fn connect(
             tokio::select! {
                 // The peer connection's own events are the authority on when we're
                 // up, and the source of the local candidates we trickle out.
-                ev = event_rx.recv() => match ev {
+                ev = event_rx.next() => match ev {
                     Some(datachannel_wrapper::PeerConnectionEvent::IceCandidate(c)) => {
                         let _ = send_signal(
                             &mut signaling_stream,
@@ -738,7 +739,7 @@ pub async fn connect(
         // for the life of the connection; it ends when the connection is dropped
         // (the event sender goes away).
         tokio::spawn(async move {
-            while let Some(ev) = event_rx.recv().await {
+            while let Some(ev) = event_rx.next().await {
                 if let datachannel_wrapper::PeerConnectionEvent::ConnectionStateChange(state) = ev {
                     log::info!("pvp peer connection state: {state:?}");
                 }
