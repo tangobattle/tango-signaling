@@ -1210,6 +1210,7 @@ dependencies = [
  "tokio-tungstenite-wasm",
  "url",
  "urlencoding",
+ "wasm-bindgen-futures",
  "webpki-roots",
 ]
 

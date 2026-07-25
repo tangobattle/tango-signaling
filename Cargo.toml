@@ -60,6 +60,7 @@ tokio-tungstenite = { version = "0.16", features = [
 # since `tokio::time` wants a runtime a browser can't host (see `time`).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 gloo-timers = { version = "0.3", features = ["futures"] }
+wasm-bindgen-futures = "0.4"
 tokio-tungstenite-wasm = { version = "0.8", optional = true }
 
 [build-dependencies]

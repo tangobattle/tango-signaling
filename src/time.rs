@@ -1,10 +1,11 @@
-//! Timers, per target.
+//! Timers and task spawning, per target.
 //!
 //! `tokio::time` needs a runtime with a timer driver, which a browser has
 //! no way to provide — reaching for one there panics on `Instant::now`
-//! before it even gets to the driver. The page's own timers do the job
-//! instead, behind the two shapes this crate's loops actually use: a
-//! deadline on a read, and a ping cadence.
+//! before it even gets to the driver, and `tokio::spawn` has nothing to
+//! spawn onto. The page's own timers and microtask queue do the job
+//! instead, behind the shapes this crate's loops actually use: a deadline
+//! on a read, a ping cadence, and a detached task.
 
 /// Sleep for `duration`.
 #[cfg(not(target_arch = "wasm32"))]
@@ -75,4 +76,18 @@ impl Ticker {
         #[cfg(target_arch = "wasm32")]
         sleep(self.period).await;
     }
+}
+
+/// Spawn a detached task.
+///
+/// Natively that's the runtime's; in a browser it's the microtask queue,
+/// which is why the future needn't be `Send` there.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn spawn(future: impl std::future::Future<Output = ()> + Send + 'static) {
+    tokio::spawn(future);
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn spawn(future: impl std::future::Future<Output = ()> + 'static) {
+    wasm_bindgen_futures::spawn_local(future);
 }

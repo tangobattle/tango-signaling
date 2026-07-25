@@ -276,6 +276,7 @@ async fn establish(
         Vec<datachannel_wrapper::DataChannel>,
         datachannel_wrapper::EventReceiver,
         datachannel_wrapper::PeerConnection,
+        String,
         Vec<String>,
     ),
     Error,
@@ -357,7 +358,7 @@ async fn establish(
             which: Some(crate::proto::signaling::packet::Which::Start(
                 crate::proto::signaling::packet::Start {
                     protocol_version,
-                    offer_sdp: offer.sdp,
+                    offer_sdp: offer.sdp.clone(),
                     connection_id: connection_id.to_vec(),
                 },
             )),
@@ -366,7 +367,7 @@ async fn establish(
     )
     .await?;
 
-    Ok((signaling_stream, dcs, event_rx, peer_conn, early_candidates))
+    Ok((signaling_stream, dcs, event_rx, peer_conn, offer.sdp, early_candidates))
 }
 
 /// Outcome of waiting on a single signaling websocket for the peer to begin the
@@ -375,8 +376,21 @@ enum WaitOutcome {
     /// We received the peer's `Offer` (and answered it) or `Answer` (and applied
     /// it). The peer has committed to this handshake — `peer_conn` now holds the
     /// remote description and we proceed to the ICE phase. Carries the peer's
-    /// server-attested client-certificate fingerprint from the relayed packet.
-    Exchanged { peer_client_cert_fingerprint: Vec<u8> },
+    /// server-attested client-certificate fingerprint from the relayed packet,
+    /// and both sides' SDP as exchanged.
+    ///
+    /// The SDPs come back rather than being read off the peer connection
+    /// afterwards because a browser applies a description asynchronously —
+    /// `set_remote_description` has only *queued* it by the time it returns,
+    /// so reading it straight back finds nothing there. What crossed the wire
+    /// is what both targets agree on.
+    Exchanged {
+        peer_client_cert_fingerprint: Vec<u8>,
+        /// The answer we sent, when we were the polite side. `None` when we
+        /// offered — the offer we already have stands as our local SDP.
+        local_sdp: Option<String>,
+        remote_sdp: String,
+    },
     /// The websocket dropped (closed / reset / timed out / EOF) *before* the peer
     /// sent any SDP. Nothing is committed on either side, so it's safe to throw
     /// this connection away and reconnect from scratch.
@@ -495,7 +509,7 @@ async fn wait_for_exchange(
                         crate::proto::signaling::Packet {
                             which: Some(crate::proto::signaling::packet::Which::Answer(
                                 crate::proto::signaling::packet::Answer {
-                                    sdp: local_description.sdp,
+                                    sdp: local_description.sdp.clone(),
                                     // Server-filled: the relay attaches *our* fingerprint
                                     // (observed at its TLS layer) when it forwards this
                                     // answer to the offerer. Nothing we set here survives.
@@ -509,6 +523,8 @@ async fn wait_for_exchange(
                 log::info!("sent answer to impolite side");
                 return Ok(WaitOutcome::Exchanged {
                     peer_client_cert_fingerprint: offer.client_cert_fingerprint_sha256.clone(),
+                    local_sdp: Some(local_description.sdp),
+                    remote_sdp: offer.sdp.clone(),
                 });
             }
             Some(crate::proto::signaling::packet::Which::Answer(answer)) => {
@@ -523,6 +539,9 @@ async fn wait_for_exchange(
                 })?;
                 return Ok(WaitOutcome::Exchanged {
                     peer_client_cert_fingerprint: answer.client_cert_fingerprint_sha256.clone(),
+                    // We offered, so the offer we sent is still our local SDP.
+                    local_sdp: None,
+                    remote_sdp: answer.sdp.clone(),
                 });
             }
             _ => {
@@ -555,7 +574,7 @@ pub async fn connect(
     // The initial dial surfaces failures to the caller (so "couldn't reach the
     // matchmaking server" is reported promptly); transparent reconnects only
     // kick in once we've successfully connected at least once.
-    let (mut signaling_stream, mut dcs, mut event_rx, mut peer_conn, early_candidates) = establish(
+    let (mut signaling_stream, mut dcs, mut event_rx, mut peer_conn, mut local_sdp, early_candidates) = establish(
         addr,
         session_id,
         use_relay,
@@ -578,7 +597,7 @@ pub async fn connect(
         // Wait for the peer to start the SDP exchange. As long as the peer hasn't
         // started, a websocket drop is recoverable: tear everything down and dial
         // again with a fresh peer connection / offer.
-        let peer_client_cert_fingerprint = loop {
+        let (peer_client_cert_fingerprint, remote_sdp) = loop {
             match wait_for_exchange(
                 &mut signaling_stream,
                 &mut event_rx,
@@ -589,7 +608,14 @@ pub async fn connect(
             {
                 WaitOutcome::Exchanged {
                     peer_client_cert_fingerprint,
-                } => break peer_client_cert_fingerprint,
+                    local_sdp: answered,
+                    remote_sdp,
+                } => {
+                    if let Some(answered) = answered {
+                        local_sdp = answered;
+                    }
+                    break (peer_client_cert_fingerprint, remote_sdp);
+                }
                 WaitOutcome::Dropped(reason) => {
                     log::warn!(
                         "signaling websocket dropped before the peer started exchanging ({reason}); reconnecting transparently"
@@ -608,11 +634,12 @@ pub async fn connect(
                         )
                         .await
                         {
-                            Ok((s, d, e, p, early)) => {
+                            Ok((s, d, e, p, sdp, early)) => {
                                 signaling_stream = s;
                                 dcs = d;
                                 event_rx = e;
                                 peer_conn = p;
+                                local_sdp = sdp;
                                 // Fresh peer connection → the old buffer is stale;
                                 // what this attempt has gathered so far replaces it.
                                 pending_local_candidates = early;
@@ -632,29 +659,14 @@ pub async fn connect(
             }
         };
 
-        // Both ends' DTLS fingerprints, parsed from the SDP each side committed
-        // to: ours from the local description, the peer's from the remote one
-        // libdatachannel just verified against the peer's certificate. The caller
-        // pairs them to derive a rendezvous id both ends agree on.
-        let local_dtls_fingerprint = peer_conn
-            .local_description()
-            .and_then(|d| parse_dtls_fingerprint(&d.sdp))
-            .unwrap_or_default();
-        let peer_dtls_fingerprint = peer_conn
-            .remote_description()
-            .and_then(|d| parse_dtls_fingerprint(&d.sdp))
-            .unwrap_or_default();
+        // Both ends' DTLS fingerprints, parsed from the SDP each side
+        // committed to. The caller pairs them to derive a rendezvous id both
+        // ends agree on.
+        let local_dtls_fingerprint = parse_dtls_fingerprint(&local_sdp).unwrap_or_default();
+        let peer_dtls_fingerprint = parse_dtls_fingerprint(&remote_sdp).unwrap_or_default();
 
-        log::debug!(
-            "local sdp (type = {:?}): {}",
-            peer_conn.local_description().expect("local sdp").sdp_type,
-            peer_conn.local_description().expect("local sdp").sdp
-        );
-        log::debug!(
-            "remote sdp (type = {:?}): {}",
-            peer_conn.remote_description().expect("remote sdp").sdp_type,
-            peer_conn.remote_description().expect("remote sdp").sdp
-        );
+        log::debug!("local sdp: {local_sdp}");
+        log::debug!("remote sdp: {remote_sdp}");
 
         // Trickle phase: both peers now hold each other's SDP. Flush the
         // candidates we buffered during the exchange, then keep the websocket
@@ -738,7 +750,7 @@ pub async fn connect(
         // Keep draining it on a detached task that logs connection-state changes
         // for the life of the connection; it ends when the connection is dropped
         // (the event sender goes away).
-        tokio::spawn(async move {
+        time::spawn(async move {
             while let Some(ev) = event_rx.next().await {
                 if let datachannel_wrapper::PeerConnectionEvent::ConnectionStateChange(state) = ev {
                     log::info!("pvp peer connection state: {state:?}");
