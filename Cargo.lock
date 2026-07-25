@@ -188,7 +188,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 [[package]]
 name = "datachannel-facade"
 version = "0.1.0"
-source = "git+https://github.com/tangobattle/datachannel-facade#229acc19f71af3a04277e19cadf870525e25485d"
+source = "git+https://github.com/tangobattle/datachannel-facade#379c7587cf7ce5e93de028352cd76bf84e72936e"
 dependencies = [
  "libdatachannel",
  "log",
@@ -640,7 +640,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "libdatachannel"
 version = "0.2.0+0.24.3"
-source = "git+https://github.com/tangobattle/datachannel-facade#229acc19f71af3a04277e19cadf870525e25485d"
+source = "git+https://github.com/tangobattle/datachannel-facade#379c7587cf7ce5e93de028352cd76bf84e72936e"
 dependencies = [
  "libdatachannel-sys",
  "log",
@@ -652,7 +652,7 @@ dependencies = [
 [[package]]
 name = "libdatachannel-sys"
 version = "0.24.3"
-source = "git+https://github.com/tangobattle/datachannel-facade#229acc19f71af3a04277e19cadf870525e25485d"
+source = "git+https://github.com/tangobattle/datachannel-facade#379c7587cf7ce5e93de028352cd76bf84e72936e"
 dependencies = [
  "bindgen",
  "cmake",
@@ -1537,7 +1537,7 @@ dependencies = [
 [[package]]
 name = "web-datachannel"
 version = "0.1.0"
-source = "git+https://github.com/tangobattle/datachannel-facade#229acc19f71af3a04277e19cadf870525e25485d"
+source = "git+https://github.com/tangobattle/datachannel-facade#379c7587cf7ce5e93de028352cd76bf84e72936e"
 dependencies = [
  "js-sys",
  "log",

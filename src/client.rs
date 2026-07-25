@@ -725,8 +725,14 @@ pub async fn connect(
                             which: Some(crate::proto::signaling::packet::Which::IceCandidate(c)),
                         }) = crate::proto::signaling::Packet::decode(d.as_slice())
                         {
-                            let _ = peer_conn
-                                .add_remote_candidate(datachannel_wrapper::IceCandidate { candidate: c.candidate });
+                            // Logged rather than swallowed: a rejected candidate
+                            // is invisible otherwise, and enough of them means a
+                            // connection that never leaves `new`.
+                            if let Err(e) = peer_conn
+                                .add_remote_candidate(datachannel_wrapper::IceCandidate { candidate: c.candidate })
+                            {
+                                log::warn!("signaling: peer candidate rejected: {e}");
+                            }
                         }
                     }
                 }
