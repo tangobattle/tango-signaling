@@ -146,6 +146,12 @@ mod imp {
     pub fn closed() -> Error {
         Error::ConnectionClosed
     }
+
+    /// Close the socket politely, ignoring whether the peer is still
+    /// there to hear it.
+    pub async fn close(stream: &mut Stream) {
+        let _ = stream.close(None).await;
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -200,6 +206,13 @@ mod imp {
     pub fn closed() -> Error {
         Error::ConnectionClosed
     }
+
+    /// Close the socket politely. The browser has no close-frame
+    /// argument to give, so this is `Sink::close`.
+    pub async fn close(stream: &mut Stream) {
+        use futures_util::SinkExt;
+        let _ = SinkExt::close(stream).await;
+    }
 }
 
-pub use imp::{classify, closed, connect, is_transient, send_binary, Error, Frame, Stream};
+pub use imp::{classify, close, closed, connect, is_transient, send_binary, Error, Frame, Stream};

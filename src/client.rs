@@ -689,7 +689,7 @@ pub async fn connect(
 
         // Connected or failed — either way we're done with signaling. Closing is
         // best-effort; losing the close race must not fail a healthy bring-up.
-        let _ = signaling_stream.close(None).await;
+        ws::close(&mut signaling_stream).await;
         outcome?;
 
         // The peer connection's event stream is otherwise dropped once we return,
