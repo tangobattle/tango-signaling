@@ -1,0 +1,205 @@
+//! The signaling websocket, on whichever websocket the target has.
+//!
+//! Natively that's `tokio-tungstenite` over rustls, which lets the
+//! client set request headers and present an mTLS client certificate.
+//! In a browser it's `tokio-tungstenite-wasm`, i.e. the page's own
+//! `WebSocket` — and a browser lets a caller set neither: no custom
+//! headers, no client certificate. So on wasm the protocol version
+//! rides the query string instead, and the identity is dropped (see
+//! [`connect`]).
+//!
+//! Everything above this module talks in binary frames and doesn't care
+//! which of the two is underneath.
+
+use futures_util::SinkExt;
+
+/// The caller's persistent client identity, presented as a TLS client
+/// certificate (mTLS) on the signaling websocket so the server can
+/// recognize the same install across sessions. Both fields are DER: a
+/// single self-signed certificate and its private key. The certificate
+/// is only sent if the server asks for one during the TLS handshake
+/// (i.e. mTLS is enabled on the endpoint); when it doesn't, the
+/// connection proceeds as an ordinary client, so attaching an identity
+/// is always safe.
+///
+/// A browser cannot present one at all — the WebSocket API has no way
+/// to choose a client certificate — so on wasm32 this is accepted and
+/// ignored, and such a client is simply unrecognized across sessions.
+#[derive(Clone)]
+pub struct ClientIdentity {
+    pub cert_der: Vec<u8>,
+    pub key_der: Vec<u8>,
+}
+
+/// Hand-rolled so the private key never lands in a `Debug` dump (the
+/// enclosing netplay `Message` derives `Debug` and gets logged) — just
+/// the byte lengths.
+impl std::fmt::Debug for ClientIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientIdentity")
+            .field("cert_der_len", &self.cert_der.len())
+            .field("key_der_len", &self.key_der.len())
+            .finish()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+mod imp {
+    use super::*;
+
+    /// The concrete stream `tokio_tungstenite::connect_async` hands back.
+    pub type Stream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+    pub type Error = tokio_tungstenite::tungstenite::Error;
+
+    /// What came off the socket, with the frames this crate doesn't
+    /// care about already dealt with.
+    pub enum Frame {
+        Binary(Vec<u8>),
+        /// A ping (tungstenite has already queued the pong) or anything
+        /// else that isn't ours to interpret.
+        Ignored,
+        Closed,
+    }
+
+    /// Build the TLS config: the webpki root set (the same roots
+    /// tungstenite's default connector uses) plus `identity` as the
+    /// client certificate.
+    fn tls_config(identity: &ClientIdentity) -> Result<std::sync::Arc<rustls::ClientConfig>, crate::client::Error> {
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
+            rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(ta.subject, ta.spki, ta.name_constraints)
+        }));
+        let config = rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(root_store)
+            .with_single_cert(
+                vec![rustls::Certificate(identity.cert_der.clone())],
+                rustls::PrivateKey(identity.key_der.clone()),
+            )?;
+        Ok(std::sync::Arc::new(config))
+    }
+
+    pub async fn connect(
+        url: &url::Url,
+        protocol_version: u32,
+        identity: Option<&ClientIdentity>,
+    ) -> Result<Stream, crate::client::Error> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+        let mut req = url.to_string().into_client_request()?;
+        req.headers_mut().append(
+            "User-Agent",
+            HeaderValue::from_str(&format!("tango-signaling/{}", env!("CARGO_PKG_VERSION")))
+                .map_err(tokio_tungstenite::tungstenite::http::Error::from)?,
+        );
+        req.headers_mut().append(
+            "X-Tango-Protocol-Version",
+            HeaderValue::from_str(&format!("{:x}", protocol_version))
+                .map_err(tokio_tungstenite::tungstenite::http::Error::from)?,
+        );
+        // A `Connector::Rustls` carrying our client certificate, rebuilt
+        // per attempt from the shared `ClientConfig` (the `Connector`
+        // itself isn't `Clone`, but the `Arc<ClientConfig>` inside it
+        // is). With no identity we pass `None`, which lets tungstenite
+        // fall back to its default connector.
+        let connector = identity
+            .map(tls_config)
+            .transpose()?
+            .map(tokio_tungstenite::Connector::Rustls);
+        match tokio_tungstenite::connect_async_tls_with_config(req, None, connector).await {
+            Ok((stream, _)) => Ok(stream),
+            Err(tokio_tungstenite::tungstenite::Error::Http(e)) if e.status() == http::StatusCode::BAD_REQUEST => {
+                Err(crate::client::Error::server_abort(
+                    e.body().as_ref().map(|b| b.as_bytes()).unwrap_or_default(),
+                ))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn send_binary(stream: &mut Stream, bytes: Vec<u8>) -> Result<(), Error> {
+        stream.send(tokio_tungstenite::tungstenite::Message::Binary(bytes)).await
+    }
+
+    pub fn classify(message: tokio_tungstenite::tungstenite::Message) -> Frame {
+        match message {
+            tokio_tungstenite::tungstenite::Message::Binary(d) => Frame::Binary(d),
+            // Upon receiving a ping, tungstenite queues the pong itself;
+            // responding here would double it.
+            tokio_tungstenite::tungstenite::Message::Ping(_) => Frame::Ignored,
+            tokio_tungstenite::tungstenite::Message::Close(_) => Frame::Closed,
+            _ => Frame::Ignored,
+        }
+    }
+
+    /// Whether an error is a transport-level hiccup a reconnect might
+    /// paper over, as opposed to a protocol-level rejection.
+    pub fn is_transient(e: &Error) -> bool {
+        use tokio_tungstenite::tungstenite::Error as Ws;
+        matches!(
+            e,
+            Ws::ConnectionClosed | Ws::AlreadyClosed | Ws::Io(_) | Ws::Protocol(_) | Ws::Tls(_)
+        )
+    }
+
+    pub fn closed() -> Error {
+        Error::ConnectionClosed
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+mod imp {
+    use super::*;
+
+    pub type Stream = tokio_tungstenite_wasm::WebSocketStream;
+    pub type Error = tokio_tungstenite_wasm::Error;
+
+    pub enum Frame {
+        Binary(Vec<u8>),
+        Ignored,
+        Closed,
+    }
+
+    /// A browser's WebSocket takes a URL and nothing else: no request
+    /// headers to put the protocol version in, and no way to choose a
+    /// client certificate. So the version goes in the query string, and
+    /// `identity` is ignored — the server sees an anonymous client.
+    pub async fn connect(
+        url: &url::Url,
+        protocol_version: u32,
+        identity: Option<&ClientIdentity>,
+    ) -> Result<Stream, crate::client::Error> {
+        if identity.is_some() {
+            log::debug!("signaling: a browser can't present a client certificate; connecting anonymously");
+        }
+        let mut url = url.clone();
+        url.query_pairs_mut()
+            .append_pair("protocol_version", &format!("{:x}", protocol_version));
+        Ok(tokio_tungstenite_wasm::connect(url.as_str()).await?)
+    }
+
+    pub async fn send_binary(stream: &mut Stream, bytes: Vec<u8>) -> Result<(), Error> {
+        stream.send(tokio_tungstenite_wasm::Message::binary(bytes)).await
+    }
+
+    pub fn classify(message: tokio_tungstenite_wasm::Message) -> Frame {
+        match message {
+            tokio_tungstenite_wasm::Message::Binary(d) => Frame::Binary(d.into()),
+            // The browser answers pings itself, below this API.
+            tokio_tungstenite_wasm::Message::Close(_) => Frame::Closed,
+            tokio_tungstenite_wasm::Message::Text(_) => Frame::Ignored,
+        }
+    }
+
+    pub fn is_transient(e: &Error) -> bool {
+        use tokio_tungstenite_wasm::Error as Ws;
+        matches!(e, Ws::ConnectionClosed | Ws::AlreadyClosed | Ws::Io(_) | Ws::Protocol(_))
+    }
+
+    pub fn closed() -> Error {
+        Error::ConnectionClosed
+    }
+}
+
+pub use imp::{classify, closed, connect, is_transient, send_binary, Error, Frame, Stream};

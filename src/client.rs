@@ -1,55 +1,14 @@
-use futures_util::SinkExt;
 use futures_util::TryStreamExt;
 use prost::Message;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+use crate::ws;
 
 pub type AbortReason = crate::proto::signaling::packet::abort::Reason;
 
-/// The concrete websocket stream `tokio_tungstenite::connect_async` hands back.
-type SignalingStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+/// The signaling websocket, whichever one this target has (see [`ws`]).
+type SignalingStream = ws::Stream;
 
-/// The caller's persistent client identity, presented as a TLS client
-/// certificate (mTLS) on the signaling websocket so the server can recognize
-/// the same install across sessions. Both fields are DER: a single self-signed
-/// certificate and its private key. The certificate is only sent if the server
-/// asks for one during the TLS handshake (i.e. mTLS is enabled on the
-/// endpoint); when it doesn't, the connection proceeds as an ordinary client,
-/// so attaching an identity is always safe.
-#[derive(Clone)]
-pub struct ClientIdentity {
-    pub cert_der: Vec<u8>,
-    pub key_der: Vec<u8>,
-}
-
-/// Hand-rolled so the private key never lands in a `Debug` dump (the enclosing
-/// netplay `Message` derives `Debug` and gets logged) — just the byte lengths.
-impl std::fmt::Debug for ClientIdentity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClientIdentity")
-            .field("cert_der_len", &self.cert_der.len())
-            .field("key_der_len", &self.key_der.len())
-            .finish()
-    }
-}
-
-/// Build a rustls `ClientConfig` that trusts the webpki root set (same roots
-/// `tokio_tungstenite`'s default connector uses) and presents `identity` as the
-/// client certificate. Returned behind an `Arc` so it can be cloned cheaply
-/// into a fresh `Connector` on every transparent reconnect.
-fn build_tls_config(identity: &ClientIdentity) -> Result<std::sync::Arc<rustls::ClientConfig>, Error> {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
-        rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(ta.subject, ta.spki, ta.name_constraints)
-    }));
-    let config = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(root_store)
-        .with_single_cert(
-            vec![rustls::Certificate(identity.cert_der.clone())],
-            rustls::PrivateKey(identity.key_der.clone()),
-        )?;
-    Ok(std::sync::Arc::new(config))
-}
+pub use crate::ws::ClientIdentity;
 
 /// How long to wait for any signaling traffic before treating the websocket as
 /// dead. The server echoes our pings, so a healthy idle connection reads at
@@ -115,12 +74,12 @@ async fn create_data_channels(
 async fn send_signal(
     stream: &mut SignalingStream,
     which: crate::proto::signaling::packet::Which,
-) -> Result<(), tokio_tungstenite::tungstenite::Error> {
-    stream
-        .send(tokio_tungstenite::tungstenite::Message::Binary(
-            crate::proto::signaling::Packet { which: Some(which) }.encode_to_vec(),
-        ))
-        .await
+) -> Result<(), ws::Error> {
+    ws::send_binary(
+        stream,
+        crate::proto::signaling::Packet { which: Some(which) }.encode_to_vec(),
+    )
+    .await
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -130,9 +89,10 @@ pub enum Error {
 
     // Boxed: tungstenite's Error is ~136 bytes and would dominate the
     // size of every Result<_, Error> in the crate.
-    #[error("tungstenite: {0:?}")]
-    Tungstenite(Box<tokio_tungstenite::tungstenite::Error>),
+    #[error("websocket: {0:?}")]
+    Websocket(Box<ws::Error>),
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[error("rustls: {0:?}")]
     Rustls(#[from] rustls::Error),
 
@@ -145,11 +105,12 @@ pub enum Error {
     #[error("url parse error: {0:?}")]
     UrlParse(#[from] url::ParseError),
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[error("http error: {0:?}")]
     Http(#[from] tokio_tungstenite::tungstenite::http::Error),
 
-    #[error("invalid packet")]
-    InvalidPacket(tokio_tungstenite::tungstenite::Message),
+    #[error("invalid packet: not a binary frame")]
+    InvalidPacket,
 
     #[error("unexpected packet: {0:?}")]
     UnexpectedPacket(crate::proto::signaling::Packet),
@@ -164,9 +125,20 @@ pub enum Error {
     PeerConnectionClosed,
 }
 
-impl From<tokio_tungstenite::tungstenite::Error> for Error {
-    fn from(e: tokio_tungstenite::tungstenite::Error) -> Self {
-        Error::Tungstenite(Box::new(e))
+impl From<ws::Error> for Error {
+    fn from(e: ws::Error) -> Self {
+        Error::Websocket(Box::new(e))
+    }
+}
+
+impl Error {
+    /// The server's `Abort` body, as returned with an HTTP 400 during
+    /// the handshake.
+    pub(crate) fn server_abort(body: &[u8]) -> Self {
+        match crate::proto::signaling::packet::Abort::decode(body) {
+            Ok(abort) => Error::ServerAbort(AbortReason::try_from(abort.reason).unwrap_or_default()),
+            Err(e) => Error::ProstDecode(e),
+        }
     }
 }
 
@@ -175,13 +147,9 @@ impl From<tokio_tungstenite::tungstenite::Error> for Error {
 /// protocol-level rejection (server abort, malformed/unexpected packet, bad
 /// SDP). Only the former is worth retrying transparently.
 fn is_transient(e: &Error) -> bool {
-    use tokio_tungstenite::tungstenite::Error as Ws;
     match e {
         Error::Io(_) => true,
-        Error::Tungstenite(ws) => matches!(
-            **ws,
-            Ws::ConnectionClosed | Ws::AlreadyClosed | Ws::Io(_) | Ws::Protocol(_) | Ws::Tls(_)
-        ),
+        Error::Websocket(e) => ws::is_transient(e),
         _ => false,
     }
 }
@@ -260,7 +228,7 @@ async fn establish(
     protocol_version: u32,
     connection_id: &[u8],
     channels: &[ChannelSpec],
-    tls_config: Option<&std::sync::Arc<rustls::ClientConfig>>,
+    identity: Option<&ClientIdentity>,
 ) -> Result<
     (
         SignalingStream,
@@ -277,48 +245,15 @@ async fn establish(
             .finish(),
     ));
 
-    let mut req = url.to_string().into_client_request()?;
-    req.headers_mut().append(
-        "User-Agent",
-        tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&format!(
-            "tango-signaling/{}",
-            env!("CARGO_PKG_VERSION")
-        ))
-        .map_err(|e| tokio_tungstenite::tungstenite::http::Error::from(e))?,
-    );
-    req.headers_mut().append(
-        "X-Tango-Protocol-Version",
-        tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&format!("{:x}", protocol_version))
-            .map_err(|e| tokio_tungstenite::tungstenite::http::Error::from(e))?,
-    );
-    // A `Connector::Rustls` carrying our client certificate, rebuilt per
-    // attempt from the shared `ClientConfig` (the `Connector` itself isn't
-    // `Clone`, but the `Arc<ClientConfig>` inside it is). With no identity we
-    // pass `None`, which lets tungstenite fall back to its default connector.
-    let connector = tls_config.map(|c| tokio_tungstenite::Connector::Rustls(c.clone()));
-    let mut signaling_stream = match tokio_tungstenite::connect_async_tls_with_config(req, None, connector).await {
-        Ok((signaling_stream, _)) => signaling_stream,
-        Err(tokio_tungstenite::tungstenite::Error::Http(e)) if e.status() == http::StatusCode::BAD_REQUEST => {
-            let abort = crate::proto::signaling::packet::Abort::decode(
-                e.body().as_ref().map(|b| b.as_bytes()).unwrap_or_default(),
-            )?;
-            return Err(Error::ServerAbort(
-                AbortReason::try_from(abort.reason).unwrap_or_default(),
-            ));
-        }
-        Err(e) => {
-            return Err(e.into());
-        }
-    };
+    let mut signaling_stream = ws::connect(&url, protocol_version, identity).await?;
 
     let Some(raw) = signaling_stream.try_next().await? else {
         return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "stream ended early").into());
     };
 
-    let packet = if let tokio_tungstenite::tungstenite::Message::Binary(d) = raw {
-        crate::proto::signaling::Packet::decode(d.as_slice())?
-    } else {
-        return Err(Error::InvalidPacket(raw));
+    let packet = match ws::classify(raw) {
+        ws::Frame::Binary(d) => crate::proto::signaling::Packet::decode(d.as_slice())?,
+        _ => return Err(Error::InvalidPacket),
     };
 
     let Some(crate::proto::signaling::packet::Which::Hello(hello)) = packet.which else {
@@ -374,20 +309,20 @@ async fn establish(
     rtc_config.disable_auto_negotiation = true;
     let (dcs, event_rx, peer_conn) = create_data_channels(rtc_config, channels).await?;
 
-    signaling_stream
-        .send(tokio_tungstenite::tungstenite::Message::Binary(
-            crate::proto::signaling::Packet {
-                which: Some(crate::proto::signaling::packet::Which::Start(
-                    crate::proto::signaling::packet::Start {
-                        protocol_version,
-                        offer_sdp: peer_conn.local_description().unwrap().sdp.to_string(),
-                        connection_id: connection_id.to_vec(),
-                    },
-                )),
-            }
-            .encode_to_vec(),
-        ))
-        .await?;
+    ws::send_binary(
+        &mut signaling_stream,
+        crate::proto::signaling::Packet {
+            which: Some(crate::proto::signaling::packet::Which::Start(
+                crate::proto::signaling::packet::Start {
+                    protocol_version,
+                    offer_sdp: peer_conn.local_description().unwrap().sdp.to_string(),
+                    connection_id: connection_id.to_vec(),
+                },
+            )),
+        }
+        .encode_to_vec(),
+    )
+    .await?;
 
     Ok((signaling_stream, dcs, event_rx, peer_conn))
 }
@@ -436,16 +371,16 @@ async fn wait_for_exchange(
                 continue;
             }
             _ = ping_interval.tick() => {
-                if let Err(e) = signaling_stream
-                    .send(tokio_tungstenite::tungstenite::Message::Binary(
-                        crate::proto::signaling::Packet {
-                            which: Some(crate::proto::signaling::packet::Which::Ping(
-                                crate::proto::signaling::packet::Ping {},
-                            )),
-                        }
-                        .encode_to_vec(),
-                    ))
-                    .await
+                if let Err(e) = ws::send_binary(
+                    signaling_stream,
+                    crate::proto::signaling::Packet {
+                        which: Some(crate::proto::signaling::packet::Which::Ping(
+                            crate::proto::signaling::packet::Ping {},
+                        )),
+                    }
+                    .encode_to_vec(),
+                )
+                .await
                 {
                     // Couldn't even send a keepalive: the socket is gone.
                     return Ok(WaitOutcome::Dropped(e.into()));
@@ -473,25 +408,17 @@ async fn wait_for_exchange(
             }
         };
 
-        let packet = match raw {
-            tokio_tungstenite::tungstenite::Message::Binary(d) => {
-                crate::proto::signaling::Packet::decode(d.as_slice())?
-            }
-            tokio_tungstenite::tungstenite::Message::Ping(_) => {
-                // Note that upon receiving a ping message, tungstenite cues a pong reply automatically.
-                // When you call either read_message, write_message or write_pending next it will try to send that pong out if the underlying connection can take more data.
-                // This means you should not respond to ping frames manually.
+        let packet = match ws::classify(raw) {
+            ws::Frame::Binary(d) => crate::proto::signaling::Packet::decode(d.as_slice())?,
+            // A ping is answered below this API — tungstenite queues the
+            // pong itself, and a browser's socket never surfaces one.
+            ws::Frame::Ignored => {
                 continue;
             }
             // The server closed the socket on us before any exchange happened
             // (e.g. it dropped the session). Safe to reconnect.
-            tokio_tungstenite::tungstenite::Message::Close(_) => {
-                return Ok(WaitOutcome::Dropped(
-                    tokio_tungstenite::tungstenite::Error::ConnectionClosed.into(),
-                ));
-            }
-            _ => {
-                return Err(Error::InvalidPacket(raw));
+            ws::Frame::Closed => {
+                return Ok(WaitOutcome::Dropped(ws::closed().into()));
             }
         };
 
@@ -522,8 +449,8 @@ async fn wait_for_exchange(
                 peer_conn.set_local_description(datachannel_wrapper::SdpType::Answer, None)?;
 
                 let local_description = peer_conn.local_description().unwrap();
-                signaling_stream
-                    .send(tokio_tungstenite::tungstenite::Message::Binary(
+                ws::send_binary(
+                    signaling_stream,
                         crate::proto::signaling::Packet {
                             which: Some(crate::proto::signaling::packet::Which::Answer(
                                 crate::proto::signaling::packet::Answer {
@@ -533,11 +460,11 @@ async fn wait_for_exchange(
                                     // answer to the offerer. Nothing we set here survives.
                                     client_cert_fingerprint_sha256: vec![],
                                 },
-                            )),
-                        }
-                        .encode_to_vec(),
-                    ))
-                    .await?;
+                        )),
+                    }
+                    .encode_to_vec(),
+                )
+                .await?;
                 log::info!("sent answer to impolite side");
                 return Ok(WaitOutcome::Exchanged {
                     peer_client_cert_fingerprint: offer.client_cert_fingerprint_sha256.clone(),
@@ -583,10 +510,6 @@ pub async fn connect(
     // (re)connect, so the parse/validate cost (and any cert error) happens here,
     // surfaced to the caller alongside the initial dial. Cloned per attempt as a
     // cheap `Arc` bump in `establish`.
-    let tls_config = match identity.as_ref() {
-        Some(id) => Some(build_tls_config(id)?),
-        None => None,
-    };
 
     // The initial dial surfaces failures to the caller (so "couldn't reach the
     // matchmaking server" is reported promptly); transparent reconnects only
@@ -598,7 +521,7 @@ pub async fn connect(
         protocol_version,
         &connection_id,
         &channels,
-        tls_config.as_ref(),
+        identity.as_ref(),
     )
     .await?;
 
@@ -639,7 +562,7 @@ pub async fn connect(
                             protocol_version,
                             &connection_id,
                             &channels,
-                            tls_config.as_ref(),
+                            identity.as_ref(),
                         )
                         .await
                         {
@@ -744,7 +667,7 @@ pub async fn connect(
                 // suffice, so a read error isn't fatal; we keep waiting on the
                 // connection state above.
                 msg = tokio::time::timeout(READ_TIMEOUT, signaling_stream.try_next()) => {
-                    if let Ok(Ok(Some(tokio_tungstenite::tungstenite::Message::Binary(d)))) = msg {
+                    if let Ok(Ok(Some(ws::Frame::Binary(d)))) = msg.map(|r| r.map(|m| m.map(ws::classify))) {
                         if let Ok(crate::proto::signaling::Packet {
                             which: Some(crate::proto::signaling::packet::Which::IceCandidate(c)),
                         }) = crate::proto::signaling::Packet::decode(d.as_slice())
