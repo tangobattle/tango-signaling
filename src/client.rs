@@ -1,6 +1,7 @@
 use futures_util::TryStreamExt;
 use prost::Message;
 
+use crate::time;
 use crate::ws;
 
 pub type AbortReason = crate::proto::signaling::packet::abort::Reason;
@@ -394,8 +395,7 @@ async fn wait_for_exchange(
     peer_conn: &mut datachannel_wrapper::PeerConnection,
     pending_local_candidates: &mut Vec<String>,
 ) -> Result<WaitOutcome, Error> {
-    let mut ping_interval = tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
-    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ping_interval = time::Ticker::every(PING_INTERVAL);
 
     loop {
         let raw = tokio::select! {
@@ -427,7 +427,7 @@ async fn wait_for_exchange(
                 }
                 continue;
             }
-            result = tokio::time::timeout(READ_TIMEOUT, signaling_stream.try_next()) => {
+            result = time::timeout(READ_TIMEOUT, signaling_stream.try_next()) => {
                 match result {
                     // No traffic at all within the timeout: treat as a dead socket.
                     Err(_elapsed) => {
@@ -620,7 +620,7 @@ pub async fn connect(
                             }
                             Err(e) if is_transient(&e) => {
                                 log::warn!("signaling reconnect attempt failed ({e}); retrying in {backoff:?}");
-                                tokio::time::sleep(backoff).await;
+                                time::sleep(backoff).await;
                                 backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
                             }
                             // A protocol-level rejection won't fix itself on retry.
@@ -670,8 +670,7 @@ pub async fn connect(
             .await;
         }
 
-        let mut ping_interval = tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
-        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut ping_interval = time::Ticker::every(PING_INTERVAL);
 
         let outcome: Result<(), Error> = loop {
             tokio::select! {
@@ -707,7 +706,7 @@ pub async fn connect(
                 // the socket dies here the already-exchanged candidates usually
                 // suffice, so a read error isn't fatal; we keep waiting on the
                 // connection state above.
-                msg = tokio::time::timeout(READ_TIMEOUT, signaling_stream.try_next()) => {
+                msg = time::timeout(READ_TIMEOUT, signaling_stream.try_next()) => {
                     if let Ok(Ok(Some(ws::Frame::Binary(d)))) = msg.map(|r| r.map(|m| m.map(ws::classify))) {
                         if let Ok(crate::proto::signaling::Packet {
                             which: Some(crate::proto::signaling::packet::Which::IceCandidate(c)),

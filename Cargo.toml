@@ -56,8 +56,10 @@ tokio-tungstenite = { version = "0.16", features = [
 ], optional = true }
 
 # In a browser it's the page's own `WebSocket`: no headers, no client
-# certificate, no TLS of ours to configure.
+# certificate, no TLS of ours to configure — and the page's own timers,
+# since `tokio::time` wants a runtime a browser can't host (see `time`).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+gloo-timers = { version = "0.3", features = ["futures"] }
 tokio-tungstenite-wasm = { version = "0.8", optional = true }
 
 [build-dependencies]

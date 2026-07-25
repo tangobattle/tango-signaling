@@ -3,6 +3,7 @@ mod client;
 /// The signaling websocket, per target: tungstenite over rustls
 /// natively, the page's own `WebSocket` in a browser.
 #[cfg(feature = "client")]
+mod time;
 mod ws;
 
 #[cfg(feature = "client")]
