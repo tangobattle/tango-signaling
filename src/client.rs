@@ -10,8 +10,6 @@ pub type AbortReason = crate::proto::signaling::packet::abort::Reason;
 /// The signaling websocket, whichever one this target has (see [`ws`]).
 type SignalingStream = ws::Stream;
 
-pub use crate::ws::ClientIdentity;
-
 /// How long to wait for any signaling traffic before treating the websocket as
 /// dead. The server echoes our pings, so a healthy idle connection reads at
 /// least every `PING_INTERVAL`.
@@ -127,10 +125,6 @@ pub enum Error {
     #[error("websocket: {0:?}")]
     Websocket(Box<ws::Error>),
 
-    #[cfg(not(target_arch = "wasm32"))]
-    #[error("rustls: {0:?}")]
-    Rustls(#[from] rustls::Error),
-
     #[error("io: {0:?}")]
     Io(#[from] std::io::Error),
 
@@ -205,21 +199,6 @@ pub struct Connected {
     pub peer_conn: datachannel_wrapper::PeerConnection,
     pub local_dtls_fingerprint: Vec<u8>,
     pub peer_dtls_fingerprint: Vec<u8>,
-    /// SHA-256 fingerprint (raw digest bytes) of the mTLS client certificate
-    /// the peer presented on its signaling websocket — its persistent install
-    /// identity, observed by the server at the TLS layer and attached to the
-    /// relayed offer/answer. Empty when the peer presented none or the server
-    /// predates the field; callers must tolerate that.
-    pub peer_client_cert_fingerprint: Vec<u8>,
-}
-
-/// Render a fingerprint for logs: lowercase hex, or `(none)` when empty.
-fn fingerprint_display(fp: &[u8]) -> String {
-    if fp.is_empty() {
-        "(none)".to_owned()
-    } else {
-        fp.iter().map(|b| format!("{b:02x}")).collect()
-    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -269,7 +248,6 @@ async fn establish(
     protocol_version: u32,
     connection_id: &[u8],
     channels: &[ChannelSpec],
-    identity: Option<&ClientIdentity>,
 ) -> Result<
     (
         SignalingStream,
@@ -288,7 +266,7 @@ async fn establish(
             .finish(),
     ));
 
-    let mut signaling_stream = ws::connect(&url, protocol_version, identity).await?;
+    let mut signaling_stream = ws::connect(&url, protocol_version).await?;
 
     let Some(raw) = signaling_stream.try_next().await? else {
         return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "stream ended early").into());
@@ -375,9 +353,8 @@ async fn establish(
 enum WaitOutcome {
     /// We received the peer's `Offer` (and answered it) or `Answer` (and applied
     /// it). The peer has committed to this handshake — `peer_conn` now holds the
-    /// remote description and we proceed to the ICE phase. Carries the peer's
-    /// server-attested client-certificate fingerprint from the relayed packet,
-    /// and both sides' SDP as exchanged.
+    /// remote description and we proceed to the ICE phase. Carries both sides'
+    /// SDP as exchanged.
     ///
     /// The SDPs come back rather than being read off the peer connection
     /// afterwards because a browser applies a description asynchronously —
@@ -385,7 +362,6 @@ enum WaitOutcome {
     /// so reading it straight back finds nothing there. What crossed the wire
     /// is what both targets agree on.
     Exchanged {
-        peer_client_cert_fingerprint: Vec<u8>,
         /// The answer we sent, when we were the polite side. `None` when we
         /// offered — the offer we already have stands as our local SDP.
         local_sdp: Option<String>,
@@ -486,8 +462,7 @@ async fn wait_for_exchange(
             }
             Some(crate::proto::signaling::packet::Which::Offer(offer)) => {
                 log::info!(
-                    "received an offer, this is the polite side. rolling back our local description and switching to answer. peer client identity (sha256 fingerprint: {})",
-                    fingerprint_display(&offer.client_cert_fingerprint_sha256)
+                    "received an offer, this is the polite side. rolling back our local description and switching to answer"
                 );
 
                 // From here on the peer has committed to this offer: any failure
@@ -506,15 +481,11 @@ async fn wait_for_exchange(
                 let local_description = await_local_description(event_rx, pending_local_candidates).await?;
                 ws::send_binary(
                     signaling_stream,
-                        crate::proto::signaling::Packet {
-                            which: Some(crate::proto::signaling::packet::Which::Answer(
-                                crate::proto::signaling::packet::Answer {
-                                    sdp: local_description.sdp.clone(),
-                                    // Server-filled: the relay attaches *our* fingerprint
-                                    // (observed at its TLS layer) when it forwards this
-                                    // answer to the offerer. Nothing we set here survives.
-                                    client_cert_fingerprint_sha256: vec![],
-                                },
+                    crate::proto::signaling::Packet {
+                        which: Some(crate::proto::signaling::packet::Which::Answer(
+                            crate::proto::signaling::packet::Answer {
+                                sdp: local_description.sdp.clone(),
+                            },
                         )),
                     }
                     .encode_to_vec(),
@@ -522,23 +493,18 @@ async fn wait_for_exchange(
                 .await?;
                 log::info!("sent answer to impolite side");
                 return Ok(WaitOutcome::Exchanged {
-                    peer_client_cert_fingerprint: offer.client_cert_fingerprint_sha256.clone(),
                     local_sdp: Some(local_description.sdp),
                     remote_sdp: offer.sdp.clone(),
                 });
             }
             Some(crate::proto::signaling::packet::Which::Answer(answer)) => {
-                log::info!(
-                    "received an answer, this is the impolite side. peer client identity (sha256 fingerprint: {})",
-                    fingerprint_display(&answer.client_cert_fingerprint_sha256)
-                );
+                log::info!("received an answer, this is the impolite side");
 
                 peer_conn.set_remote_description(datachannel_wrapper::SessionDescription {
                     sdp_type: datachannel_wrapper::SdpType::Answer,
                     sdp: answer.sdp.clone(),
                 })?;
                 return Ok(WaitOutcome::Exchanged {
-                    peer_client_cert_fingerprint: answer.client_cert_fingerprint_sha256.clone(),
                     // We offered, so the offer we sent is still our local SDP.
                     local_sdp: None,
                     remote_sdp: answer.sdp.clone(),
@@ -557,7 +523,6 @@ pub async fn connect(
     use_relay: Option<bool>,
     protocol_version: u32,
     channels: Vec<ChannelSpec>,
-    identity: Option<ClientIdentity>,
 ) -> Result<Connecting, Error> {
     // A stable id for this logical connection attempt, sent with every `Start`.
     // It survives transparent reconnects, so when our offerer socket drops and
@@ -566,24 +531,11 @@ pub async fn connect(
     // answering peer.
     let connection_id: [u8; 16] = rand::random();
 
-    // Build the mTLS client config once: it's identical across every
-    // (re)connect, so the parse/validate cost (and any cert error) happens here,
-    // surfaced to the caller alongside the initial dial. Cloned per attempt as a
-    // cheap `Arc` bump in `establish`.
-
     // The initial dial surfaces failures to the caller (so "couldn't reach the
     // matchmaking server" is reported promptly); transparent reconnects only
     // kick in once we've successfully connected at least once.
-    let (mut signaling_stream, mut dcs, mut event_rx, mut peer_conn, mut local_sdp, early_candidates) = establish(
-        addr,
-        session_id,
-        use_relay,
-        protocol_version,
-        &connection_id,
-        &channels,
-        identity.as_ref(),
-    )
-    .await?;
+    let (mut signaling_stream, mut dcs, mut event_rx, mut peer_conn, mut local_sdp, early_candidates) =
+        establish(addr, session_id, use_relay, protocol_version, &connection_id, &channels).await?;
 
     let addr = addr.to_owned();
     let session_id = session_id.to_owned();
@@ -597,7 +549,7 @@ pub async fn connect(
         // Wait for the peer to start the SDP exchange. As long as the peer hasn't
         // started, a websocket drop is recoverable: tear everything down and dial
         // again with a fresh peer connection / offer.
-        let (peer_client_cert_fingerprint, remote_sdp) = loop {
+        let remote_sdp = loop {
             match wait_for_exchange(
                 &mut signaling_stream,
                 &mut event_rx,
@@ -607,14 +559,13 @@ pub async fn connect(
             .await?
             {
                 WaitOutcome::Exchanged {
-                    peer_client_cert_fingerprint,
                     local_sdp: answered,
                     remote_sdp,
                 } => {
                     if let Some(answered) = answered {
                         local_sdp = answered;
                     }
-                    break (peer_client_cert_fingerprint, remote_sdp);
+                    break remote_sdp;
                 }
                 WaitOutcome::Dropped(reason) => {
                     log::warn!(
@@ -630,7 +581,6 @@ pub async fn connect(
                             protocol_version,
                             &connection_id,
                             &channels,
-                            identity.as_ref(),
                         )
                         .await
                         {
@@ -769,7 +719,6 @@ pub async fn connect(
             peer_conn,
             local_dtls_fingerprint,
             peer_dtls_fingerprint,
-            peer_client_cert_fingerprint,
         })
     }))
 }

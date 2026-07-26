@@ -18,21 +18,19 @@ message Packet {
     bytes connection_id = 3;
   }
 
+  // Field 2 was the relaying server's view of the peer's mTLS client-certificate
+  // fingerprint — an install identity clients presented on the signaling
+  // websocket. Requiring a client certificate breaks browsers, so the scheme is
+  // gone; the field stays reserved on both messages so nothing collides on the
+  // wire with a peer or server that still sends it.
   message Offer {
     string sdp = 1;
-    // SHA-256 fingerprint (raw digest bytes) of the mTLS client certificate
-    // the offering peer presented on its signaling websocket, as observed by
-    // the server at the TLS layer and attached when it relays the offer.
-    // Empty when that peer presented no certificate, mTLS isn't enabled on
-    // the endpoint, or the server predates this field.
-    bytes client_cert_fingerprint_sha256 = 2;
+    reserved 2;
   }
 
   message Answer {
     string sdp = 1;
-    // The answering peer's fingerprint, mirror of
-    // `Offer.client_cert_fingerprint_sha256`.
-    bytes client_cert_fingerprint_sha256 = 2;
+    reserved 2;
   }
 
   // A single trickled ICE candidate, relayed by the server to the peer after

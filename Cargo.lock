@@ -1203,7 +1203,6 @@ dependencies = [
  "prost",
  "prost-build",
  "rand 0.8.7",
- "rustls",
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite 0.16.1",
@@ -1211,7 +1210,6 @@ dependencies = [
  "url",
  "urlencoding",
  "wasm-bindgen-futures",
- "webpki-roots",
 ]
 
 [[package]]
