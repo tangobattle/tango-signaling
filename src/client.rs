@@ -278,8 +278,21 @@ async fn establish(
         _ => return Err(Error::InvalidPacket),
     };
 
-    let Some(crate::proto::signaling::packet::Which::Hello(hello)) = packet.which else {
-        return Err(Error::UnexpectedPacket(packet));
+    let hello = match packet.which {
+        Some(crate::proto::signaling::packet::Which::Hello(hello)) => hello,
+        // A server with no intention of matchmaking for us — one that
+        // won't speak our protocol version — has nothing to put in a
+        // `Hello` and says so straight away. Read the reason here as
+        // well as mid-stream, so a rejection that arrives before the
+        // exchange has begun is still a reason rather than a surprise.
+        Some(crate::proto::signaling::packet::Which::Abort(abort)) => {
+            return Err(Error::ServerAbort(
+                AbortReason::try_from(abort.reason).unwrap_or_default(),
+            ))
+        }
+        // Rebuilt rather than matched by reference: `which` is moved by
+        // the arms above, and the error wants the whole packet.
+        which => return Err(Error::UnexpectedPacket(crate::proto::signaling::Packet { which })),
     };
 
     log::info!("hello received from signaling stream: {:?}", hello);
