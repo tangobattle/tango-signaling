@@ -35,20 +35,19 @@ rand = { version = "0.8", optional = true }
 # build the client `ClientConfig` ourselves to attach the mTLS client
 # certificate (see `client::build_tls_config`).
 thiserror = "1"
-# Everything but the parts that need an OS socket; the native table
-# adds those.
-tokio = { version = "1", features = [
-  "macros",
-  "rt",
-  "sync",
-  "time"
-], optional = true }
+# Only the parts that need no runtime under them: the sync primitives
+# and `select!`. `rt` and `time` are native-only (see the table below) —
+# a browser has a driver for neither, and every use of them here is
+# already behind the per-target seam in `time`.
+tokio = { version = "1", features = ["macros", "sync"], optional = true }
 url = { version = "2", optional = true }
 urlencoding = { version = "2", optional = true }
 
 # Natively the websocket is tungstenite over rustls, which is what lets
 # the client set request headers and present its mTLS certificate.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# The runtime halves of `time`: real timers and a real spawner.
+tokio = { version = "1", features = ["rt", "time"], optional = true }
 rustls = { version = "0.20", optional = true }
 webpki-roots = { version = "0.22", optional = true }
 tokio-tungstenite = { version = "0.16", features = [
