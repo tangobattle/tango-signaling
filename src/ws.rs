@@ -1,10 +1,12 @@
-//! The signaling websocket, on whichever websocket the target has.
+//! The signaling websocket, on whichever websocket the target has:
+//! `tokio-tungstenite` over rustls natively, `tokio-tungstenite-wasm`
+//! (the page's own `WebSocket`) in a browser.
 //!
-//! Natively that's `tokio-tungstenite` over rustls, which lets the
-//! client set request headers. In a browser it's
-//! `tokio-tungstenite-wasm`, i.e. the page's own `WebSocket` — and a
-//! browser lets a caller set no headers at all. So on wasm the protocol
-//! version rides the query string instead (see [`connect`]).
+//! Both take a URL and nothing else. A browser lets a caller set no
+//! request headers at all, so everything the server needs to see rides
+//! the query string — and it rides it on both targets, so the server
+//! sees one kind of connection rather than a desktop and a web dialect
+//! of the same one.
 //!
 //! Everything above this module talks in binary frames and doesn't care
 //! which of the two is underneath.
@@ -29,22 +31,8 @@ mod imp {
         Closed,
     }
 
-    pub async fn connect(url: &url::Url, protocol_version: u32) -> Result<Stream, crate::client::Error> {
-        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-        use tokio_tungstenite::tungstenite::http::HeaderValue;
-
-        let mut req = url.to_string().into_client_request()?;
-        req.headers_mut().append(
-            "User-Agent",
-            HeaderValue::from_str(&format!("tango-signaling/{}", env!("CARGO_PKG_VERSION")))
-                .map_err(tokio_tungstenite::tungstenite::http::Error::from)?,
-        );
-        req.headers_mut().append(
-            "X-Tango-Protocol-Version",
-            HeaderValue::from_str(&format!("{:x}", protocol_version))
-                .map_err(tokio_tungstenite::tungstenite::http::Error::from)?,
-        );
-        match tokio_tungstenite::connect_async(req).await {
+    pub async fn connect(url: &url::Url) -> Result<Stream, crate::client::Error> {
+        match tokio_tungstenite::connect_async(url.as_str()).await {
             Ok((stream, _)) => Ok(stream),
             Err(tokio_tungstenite::tungstenite::Error::Http(e)) if e.status() == http::StatusCode::BAD_REQUEST => {
                 Err(crate::client::Error::server_abort(
@@ -104,13 +92,7 @@ mod imp {
         Closed,
     }
 
-    /// A browser's WebSocket takes a URL and nothing else — no request
-    /// headers to put the protocol version in — so the version goes in
-    /// the query string.
-    pub async fn connect(url: &url::Url, protocol_version: u32) -> Result<Stream, crate::client::Error> {
-        let mut url = url.clone();
-        url.query_pairs_mut()
-            .append_pair("protocol_version", &format!("{:x}", protocol_version));
+    pub async fn connect(url: &url::Url) -> Result<Stream, crate::client::Error> {
         Ok(tokio_tungstenite_wasm::connect(url.as_str()).await?)
     }
 

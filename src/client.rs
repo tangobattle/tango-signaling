@@ -134,10 +134,6 @@ pub enum Error {
     #[error("url parse error: {0:?}")]
     UrlParse(#[from] url::ParseError),
 
-    #[cfg(not(target_arch = "wasm32"))]
-    #[error("http error: {0:?}")]
-    Http(#[from] tokio_tungstenite::tungstenite::http::Error),
-
     #[error("invalid packet: not a binary frame")]
     InvalidPacket,
 
@@ -259,14 +255,19 @@ async fn establish(
     ),
     Error,
 > {
+    // Everything the server sees before the first frame goes in the query
+    // string, on every target: a browser's `WebSocket` can't carry request
+    // headers, so putting the protocol version in one natively would just give
+    // the server two dialects of the same connection to understand.
     let mut url = url::Url::parse(addr)?;
     url.set_query(Some(
         &url::form_urlencoded::Serializer::new(String::new())
             .append_pair("session_id", session_id)
+            .append_pair("protocol_version", &format!("{protocol_version:x}"))
             .finish(),
     ));
 
-    let mut signaling_stream = ws::connect(&url, protocol_version).await?;
+    let mut signaling_stream = ws::connect(&url).await?;
 
     let Some(raw) = signaling_stream.try_next().await? else {
         return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "stream ended early").into());
