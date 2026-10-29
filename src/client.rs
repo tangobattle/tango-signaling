@@ -21,6 +21,13 @@ const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 const MIN_RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
 const MAX_RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// How many times the first dial is tried when it fails on the transport. A
+/// connection that drops mid-handshake is common on long, lossy routes (from
+/// mainland China to Cloudflare's overseas edges, a TCP close without a TLS
+/// close_notify reads as "unexpected end of file") and usually works on the
+/// next try. With the backoff above, the tries span about 8 seconds of waits.
+const INITIAL_DIAL_ATTEMPTS: u32 = 5;
+
 /// One data channel's `(label, init)`. The caller owns the channel policy
 /// (label / stream id / reliability) rather than this crate hardcoding it, and
 /// passes every channel the session needs so they're all created together,
@@ -545,11 +552,24 @@ pub async fn connect(
     // answering peer.
     let connection_id: [u8; 16] = rand::random();
 
-    // The initial dial surfaces failures to the caller (so "couldn't reach the
-    // matchmaking server" is reported promptly); transparent reconnects only
-    // kick in once we've successfully connected at least once.
-    let (mut signaling_stream, mut dcs, mut event_rx, mut peer_conn, mut local_sdp, early_candidates) =
-        establish(addr, session_id, use_relay, protocol_version, &connection_id, &channels).await?;
+    // The initial dial retries transport hiccups a few times, then surfaces the
+    // failure to the caller (so "couldn't reach the matchmaking server" is still
+    // reported promptly); a rejection is surfaced at once. Unbounded transparent
+    // reconnects only kick in once we've successfully connected at least once.
+    let mut backoff = MIN_RECONNECT_BACKOFF;
+    let mut attempt = 1;
+    let (mut signaling_stream, mut dcs, mut event_rx, mut peer_conn, mut local_sdp, early_candidates) = loop {
+        match establish(addr, session_id, use_relay, protocol_version, &connection_id, &channels).await {
+            Ok(established) => break established,
+            Err(e) if attempt < INITIAL_DIAL_ATTEMPTS && is_transient(&e) => {
+                log::warn!("signaling dial attempt {attempt} failed ({e}); retrying in {backoff:?}");
+                time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    };
 
     let addr = addr.to_owned();
     let session_id = session_id.to_owned();
